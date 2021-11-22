@@ -1,0 +1,244 @@
+### PREWORK
+# 1. Check that Posrgres version is 13
+# 2. Check that RHEL version is 8.5 
+# 3. Check that all postgres bins is installed
+
+   #dnf install -y postgresql postgresql-contrib postgresql-server \
+               pacemaker resource-agents pcs \
+               fence-agents-all
+
+# 4. Set UP firewall parameters according to offitial documentation ( enable services : High-Availabillity and port 5432 )
+# 5. Set UP nfs Server on the 3rd server for WAL retention (nfs-server/rpcbind ) and mounted with /var/lib/pgsql/archive/ mountpoint on the both pgsql cluster nodes
+# 6. Check that pacemaker and corosync are enabled and started on both cluster nodes:
+
+   pcs cluster setup open_pgsql_cluster --start postgres-1.data.lan postgres-2.data.lan
+
+# 7. Check that vmware_fence resource started on any node:
+
+   # pcs stonith create vmware-fence fence_vmware_rest pcmk_host_map="postgres-1.data.lan:postgres-1.data.lan; postgres-2.data.lan:postgres-2.data.lan" ipaddr=10.216.1.8 ssl=1 login='vcenter.home.lan\admin' passwd='P@ssw0rd'
+
+# 8. check that the cluster has already set up ( playbook + role example to set up cluster quickly)
+
+---
+- name: preparing hosts to deploying ha_cluster
+  hosts: all
+  vars:
+    ha_cluster_cluster_name: pgsql_cluster
+    ha_cluster_hacluster_password: P@ssw0rd
+  become: true
+  gather_facts: true
+  roles:
+    - rhel-system-roles.ha_cluster
+
+
+=> hacluster user password for openbank hacluster set following
+
+hacluster: P@ssw0rd
+
+
+### STARTING POINT
+
+### init database on the Master node and set up configuration
+
+/usr/bin/postgresql-setup initdb
+
+
+#Set configuration for postgresql.conf
+
+listen_addresses = '*'
+max_wal_senders = 10
+hba_file = '/var/lib/pgsql/conf/pg_hba.conf'
+recovery_target_timeline = 'latest'
+hot_standby = on
+archive_mode = on
+synchronous_standby_names = '*'
+archive_command = 'cp %p /var/lib/pgsql/archive/%f'
+
+
+### configure PGA:
+
+configure /var/lib/pgsq/conf/pg_hba.conf
+
+### SET PG_HBA (first node)
+
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+local   all             all                                     trust
+host    replication     all             127.0.0.1/32            ident
+host    replication     all             ::1/128                 ident
+### reject self-replication
+host    replication     all           postgres-1.data.lan reject
+host    replication     all           10.216.18.100/32 reject #<= VIP
+host    replication     replicator 10.216.17.60/32      md5
+
+### SET PG_HBA (second node)
+
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+local   all             all                                     trust
+host    replication     all             127.0.0.1/32            ident
+host    replication     all             ::1/128                 ident
+host    replication     all           postgres-2.data.lan reject
+host    replication     all           10.216.18.100/32 reject #<= VIP
+host    replication     replicator 10.216.17.60/32      md5
+
+
+### Create IP Addres for Basic cluster VIP
+
+pcs resource create vip-master IPaddr2 \
+   ip="10.216.18.100" \
+   nic="ens192" \
+   cidr_netmask="19" \
+   op monitor timeout="60s" interval="10s" on-fail="restart" \
+   op stop timeout="60s" interval="0s" on-fail="ignore" \
+   op start timeout="60s" interval="0s" on-fail="stop"
+
+
+If it start on the second node - move the resource and then delete constraint while creating basic resource (pcs resource move)
+
+create password for replicator user which will be used for replication
+
+password for replicator user: P@ssw0rd
+
+
+### Start DB on the first node:
+
+start -D /var/lib/pgsql/data/
+
+### Sync the base from STANDBY SERVER
+
+pg_basebackup -h VIP-ADDRESS -D /var/lib/pgsql/data -U replicator -P -v  -R -X stream
+
+### Start DB on the second node
+
+start -D /var/lib/pgsql/data/
+And check for replica and for standby file
+
+psql -c "\x" -c "SELECT * FROM pg_stat_wal_receiver;"
+
+# if everything is OK, stop the DB on both nodes and check that standby.signal file on the second node exists.
+
+
+#### URGENT:
+#### COPY connection string from postgresql.auto.conf from the second node ( it will be used for primary_connfinfo string while resource creating )(connection_primary)!!!!
+Add dbname parameter:
+primary_conninfo = 'dbname=replication password=P@ssw0rd channel_binding=prefer sslmode=prefer sslcompression=0 ssl_min_protocol_version=TLSv1.2 gssencmode=prefer krbsrvname=postgres target_session_attrs=any'
+
+!!!! and delete postgres.auto.conf from both nodes if it exists!!!!!
+
+### Disable pgsql services on both nodes to allow the pacemaker to work with pgsql dirrectly
+
+systemctl disable postgresql --now
+
+### Add basic parameters for stickness and migration threshold
+pcs resource defaults update migration-threshold=5
+pcs resource defaults update stonith-action=reboot
+pcs resource defaults update resource-stickiness=10
+
+
+#### Create new pgsql-ha resource
+
+
+pcs resource create pgsql-ha pgsql \
+   pgctl="/usr/bin/pg_ctl" \
+   psql="/usr/bin/psql" \
+   pgdata="/var/lib/pgsql/data" \
+   logfile="/var/lib/pgsql/tmp/pgsql-server.log" \
+   rep_mode='sync' \
+   repuser="replicator" \
+   restore_command='cp /var/lib/pgsql/archive/%f %p' \
+   primary_conninfo_opt="dbname=replication password=P@ssw0rd channel_binding=prefer sslmode=prefer sslcompression=0 ssl_min_protocol_version=TLSv1.2 gssencmode=prefer krbsrvname=postgres target_session_attrs=any" \
+   node_list='postgres-2.data.lan postgres-2.data.lan' \
+   master_ip="10.216.18.100" \
+   restart_on_promote="true" \
+   check_wal_receiver="false" \
+   op monitor role="Master" timeout=700 interval="2s" \
+   op monitor role="Slave" timeout=700 interval="4s" \
+   op start timeout=3600 interval="0s" on-fail="restart" \
+   op stop timeout=3600 on-fail="block" \
+   op promote timeout="60s" interval="0s"  on-fail="restart" \
+   op demote timeout=3600 on-fail="stop"\
+   promotable master-max=1 master-node-max=1 meta notify=true clone-max=2 interleave=true
+
+#### check that everything OK from replica prospective with using crm_mon command
+
+#crm_mon -A1
+
+Node List:
+  * Online: [ postgres-1.data.lan postgres-2.data.lan ]
+
+Active Resources:
+  * vmware-fence        (stonith:fence_vmware_rest):     Started postgres-1.data.lan
+  * Clone Set: pgsql-ha-clone [pgsql-ha] (promotable):
+    * Masters: [ postgres-1.data.lan ]
+    * Slaves: [ postgres-2.data.lan ]
+  * Resource Group: master-group:
+    * vip-master        (ocf::heartbeat:IPaddr2):        Started postgres-2.data.lan
+
+Node Attributes:
+  * Node: postgres-1.data.lan:
+    * master-pgsql-ha                   : 1000
+    * pgsql-ha-data-status              : LATEST
+    * pgsql-ha-status                   : PRI
+  * Node: postgres-2.data.lan:
+    * master-pgsql-ha                   : 100
+    * pgsql-ha-data-status              : STREAMING|SYNC
+    * pgsql-ha-status                   : HS:sync
+
+
+Second node should be in SYNC mode
+
+
+### CREATE MASTER GROUP to Group addresses and MASTERS
+sudo pcs resource group add master-group vip-master
+sudo pcs constraint colocation add master-group with Master pgsql-ha-clone
+sudo pcs constraint order promote pgsql-ha-clone then start master-group symmetrical=false score=INFINITY
+sudo pcs constraint order demote pgsql-ha-clone then stop master-group symmetrical=false score=0
+
+
+
+### Setting up Quorum 
+## On the 3rd node
+yum install pcs corosync-qnetd
+systemctl start pcsd.service
+systemctl enable pcsd.service
+pcs qdevice setup model net --enable --start
+firewall-cmd --permanent --add-service=high-availability
+firewall-cmd --add-service=high-availability
+firewall-cmd --reload
+
+# On the both nodes:
+dnf install corosync-qdevice
+# From the first node
+pcs host auth postgres-3.data.lan
+pcs quorum device add model net host=postgres-3.data.lan algorithm=ffsplit
+
+
+# Check Status
+pcs quorum status
+
+#### pcs status should be look like this:
+
+ pcs status
+Cluster name: pgsql_cluster
+Cluster Summary:
+  * Stack: corosync
+  * Current DC: postgres-2.data.lan (version 2.0.4-6.el8_3.2-2deceaa3ae) - partition with quorum
+  * Last updated: Mon Nov 22 14:36:58 2021
+  * Last change:  Mon Nov 22 14:10:42 2021 by root via crm_attribute on postgres-1.data.lan
+  * 2 nodes configured
+  * 4 resource instances configured
+
+Node List:
+  * Online: [ postgres-1.data.lan postgres-2.data.lan ]
+
+Full List of Resources:
+  * vmware-fence        (stonith:fence_vmware_rest):     Started postgres-1.data.lan
+  * Clone Set: pgsql-ha-clone [pgsql-ha] (promotable):
+    * Masters: [ postgres-1.data.lan ]
+    * Slaves: [ postgres-2.data.lan ]
+  * Resource Group: master-group:
+    * vip-master        (ocf::heartbeat:IPaddr2):        Started postgres-2.data.lan
+
+Daemon Status:
+  corosync: active/enabled
+  pacemaker: active/enabled
+  pcsd: active/enabled
