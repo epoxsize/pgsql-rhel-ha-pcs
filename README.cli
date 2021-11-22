@@ -1,6 +1,8 @@
 ### PREWORK
 # 1. Check that Posrgres version is 13
+   #dnf module enable postgresql:13
 # 2. Check that RHEL version is 8.5 
+   # cat /etc/redhat-release
 # 3. Check that all postgres bins is installed
 
    #dnf install -y postgresql postgresql-contrib postgresql-server \
