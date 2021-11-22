@@ -11,7 +11,7 @@
 # 5. Set UP nfs Server on the 3rd server for WAL retention (nfs-server/rpcbind ) and mounted with /var/lib/pgsql/archive/ mountpoint on the both pgsql cluster nodes
 # 6. Check that pacemaker and corosync are enabled and started on both cluster nodes:
 
-   pcs cluster setup open_pgsql_cluster --start postgres-1.data.lan postgres-2.data.lan
+   pcs cluster setup pgsql_cluster --start postgres-1.data.lan postgres-2.data.lan
 
 # 7. Check that vmware_fence resource started on any node:
 
@@ -31,7 +31,7 @@
     - rhel-system-roles.ha_cluster
 
 
-=> hacluster user password for openbank hacluster set following
+=> hacluster user password for hacluster set following
 
 hacluster: P@ssw0rd
 
